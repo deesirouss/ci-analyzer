@@ -1,0 +1,75 @@
+name: CI + AI Failure Analyzer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─── Job 1: Build ────────────────────────────────────────────────────────────
+  # This job intentionally fails: react@17 + react-dom@18 = ERESOLVE
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Node.js 24 LTS
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install dependencies (will fail — peer conflict)
+        run: npm install
+
+  # ─── Job 2: AI Failure Analyzer ──────────────────────────────────────────────
+  # Only runs when build fails. Mirrors Day 06 Lab 2 (Gemini cloud agent).
+  # Tools: read_log_file → search_similar_failures → analyze_root_cause
+  #         → draft_pr_description → create_github_pr
+  analyze-failure:
+    name: analyze-failure
+    needs: build
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Python 3.14
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Install google-genai
+        run: pip install google-genai==2.20.0
+
+      - name: Download failed build job logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          JOB_ID=$(gh api \
+            /repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs \
+            --jq '.jobs[] | select(.name == "build") | .id')
+
+          echo "Build job ID: $JOB_ID"
+
+          gh api /repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs \
+            > ci_failure.log
+
+          echo "Log downloaded: $(wc -l < ci_failure.log) lines"
+          tail -20 ci_failure.log
+
+      - name: Run AI analysis and create PR
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: python3 .github/scripts/analyze_and_pr.py
