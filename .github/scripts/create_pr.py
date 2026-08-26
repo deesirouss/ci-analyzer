@@ -117,12 +117,28 @@ run(["git", "config", "user.email", f"{GITHUB_ACTOR}@users.noreply.github.com"])
 run(["git", "config", "user.name", GITHUB_ACTOR])
 kv("git user", f"{GITHUB_ACTOR}@users.noreply.github.com")
 
-result = run(["git", "checkout", "-b", branch], check=False, capture=True)
-if result.returncode != 0:
-    print(f"  Branch already exists — checking out")
+# Always fetch to see current remote state
+run(["git", "fetch", "origin"])
+
+remote_check = run(
+    ["git", "ls-remote", "--heads", "origin", branch],
+    capture=True, check=False,
+)
+branch_exists_on_remote = bool(remote_check.stdout.strip())
+
+if branch_exists_on_remote:
+    # Pull existing branch, then merge latest main so the PR always has current code
     run(["git", "checkout", branch])
+    merge = run(["git", "merge", "origin/main", "--no-edit"], check=False, capture=True)
+    if merge.returncode != 0:
+        run(["git", "merge", "--abort"], check=False)
+        kv("Branch", f"{branch} (exists — merge conflict with main, skipping merge)")
+    else:
+        kv("Branch", f"{branch} (exists — merged latest main ✅)")
 else:
-    print(f"  Branch created: {branch}")
+    # Create fresh branch from latest main
+    run(["git", "checkout", "-b", branch, "origin/main"])
+    kv("Branch", f"{branch} (created from origin/main ✅)")
 
 
 # ─── Apply the actual file fix ────────────────────────────────────────────────
@@ -202,10 +218,9 @@ print(f"  {DIVIDER}")
 print("  Pushing branch")
 print(f"  {DIVIDER}")
 
-# --force: safe for ephemeral AI-generated fix branches — no shared work on them.
-# --force-with-lease was rejected ("stale info") because actions/checkout pre-fetches
-# remote branches, causing the lease expectation to mismatch on re-runs.
-run(["git", "push", "origin", branch, "--force"])
+# No force push needed — branch is always built from or merged with origin/main,
+# so local is always ahead of or equal to remote.
+run(["git", "push", "origin", branch])
 kv("Pushed", f"origin/{branch}")
 
 
