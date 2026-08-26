@@ -28,6 +28,9 @@ REPO = os.environ.get("REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "unknown")
 COMMIT_SHA = os.environ.get("COMMIT_SHA", "unknown")
 SHORT_SHA = COMMIT_SHA[:7]
+# Branch that triggered the workflow — PR targets this, fix branch merges from it.
+# Never hardcoded: works for main, develop, release/*, feature/* equally.
+TRIGGER_BRANCH = os.environ.get("TRIGGER_BRANCH", "main")
 
 
 def kv(key, value, indent=2):
@@ -126,19 +129,21 @@ remote_check = run(
 )
 branch_exists_on_remote = bool(remote_check.stdout.strip())
 
+kv("Base branch", TRIGGER_BRANCH)
+
 if branch_exists_on_remote:
-    # Pull existing branch, then merge latest main so the PR always has current code
+    # Pull existing branch, then merge the triggering branch so the PR always has current code
     run(["git", "checkout", branch])
-    merge = run(["git", "merge", "origin/main", "--no-edit"], check=False, capture=True)
+    merge = run(["git", "merge", f"origin/{TRIGGER_BRANCH}", "--no-edit"], check=False, capture=True)
     if merge.returncode != 0:
         run(["git", "merge", "--abort"], check=False)
-        kv("Branch", f"{branch} (exists — merge conflict with main, skipping merge)")
+        kv("Branch", f"{branch} (exists — merge conflict with {TRIGGER_BRANCH}, skipping merge)")
     else:
-        kv("Branch", f"{branch} (exists — merged latest main ✅)")
+        kv("Branch", f"{branch} (exists — merged latest {TRIGGER_BRANCH} ✅)")
 else:
-    # Create fresh branch from latest main
-    run(["git", "checkout", "-b", branch, "origin/main"])
-    kv("Branch", f"{branch} (created from origin/main ✅)")
+    # Create fresh branch from the branch that triggered the workflow
+    run(["git", "checkout", "-b", branch, f"origin/{TRIGGER_BRANCH}"])
+    kv("Branch", f"{branch} (created from origin/{TRIGGER_BRANCH} ✅)")
 
 
 # ─── Apply the actual file fix ────────────────────────────────────────────────
@@ -254,7 +259,7 @@ pr_result = run(
         "gh", "pr", "create",
         "--title", pr_title,
         "--body", pr_description,
-        "--base", "main",
+        "--base", TRIGGER_BRANCH,
         "--head", branch,
     ],
     capture=True,

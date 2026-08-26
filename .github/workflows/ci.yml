@@ -86,5 +86,6 @@ jobs:
           REPO: ${{ github.repository }}
           GITHUB_ACTOR: ${{ github.actor }}
           COMMIT_SHA: ${{ github.sha }}
+          TRIGGER_BRANCH: ${{ github.ref_name }}
           PYTHONUNBUFFERED: "1"
         run: python3 .github/scripts/create_pr.py
