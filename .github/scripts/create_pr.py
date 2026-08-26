@@ -38,6 +38,31 @@ def run(cmd, check=True, capture=False):
     return subprocess.run(cmd, check=check, capture_output=capture, text=True)
 
 
+def _parse_npm_packages(fix_command: str) -> dict:
+    """
+    Parse npm fix_command into {package_name: version}.
+    Handles: 'npm install react@18.0.0 react-dom@18.0.0 --save-exact'
+    Handles scoped packages: '@company/utils@1.2.3'
+    """
+    skip = {"npm", "install", "add", "i"}
+    result = {}
+    for part in fix_command.split():
+        if part.startswith("-"):
+            continue
+        if part in skip:
+            continue
+        # Scoped package: @scope/name@version
+        if part.startswith("@") and part.count("@") >= 2:
+            at_idx = part.rfind("@")
+            result[part[:at_idx]] = part[at_idx + 1:]
+        # Regular package: name@version
+        elif "@" in part:
+            name, ver = part.rsplit("@", 1)
+            if name:
+                result[name] = ver
+    return result
+
+
 print(f"{'━' * 62}")
 print(f"  CI FAILURE ANALYZER — Create Fix PR")
 print(f"  Commit: {SHORT_SHA}  |  Run: {RUN_ID}")
@@ -64,7 +89,6 @@ fix_command = data.get("fix_command", "—")
 severity = data.get("severity", "—")
 confidence = data.get("confidence", "—")
 affected_file = data.get("affected_file", "—")
-dependency_updates = data.get("dependency_updates", {})
 kb = data.get("knowledge_base_match", {})
 
 print()
@@ -114,19 +138,14 @@ print(f"  {DIVIDER}")
 files_changed = []
 
 if error_type == "npm-dependency":
-    packages = dependency_updates.get("packages", [])
-    if packages and os.path.exists("package.json"):
+    parsed = _parse_npm_packages(fix_command)
+    if parsed and os.path.exists("package.json"):
         with open("package.json") as f:
             pkg = json.load(f)
 
         print(f"  Patching package.json:")
         changed = False
-        for update in packages:
-            name = update.get("name")
-            to_ver = update.get("to")
-            from_ver = update.get("from")
-            if not name or not to_ver:
-                continue
+        for name, to_ver in parsed.items():
             for dep_key in ("dependencies", "devDependencies", "peerDependencies"):
                 if dep_key in pkg and name in pkg[dep_key]:
                     current = pkg[dep_key][name]
@@ -142,10 +161,10 @@ if error_type == "npm-dependency":
             files_changed.append("package.json")
             print(f"  package.json updated and staged ✅")
         else:
-            print(f"  ⚠️  Could not match packages to patch — committing analysis only")
+            print(f"  ⚠️  Packages from fix_command not found in package.json — analysis only")
     else:
-        print(f"  ⚠️  No dependency_updates in analysis or package.json not found")
-        print(f"  Manual fix required: {fix_command}")
+        print(f"  ⚠️  Could not parse packages from fix_command or package.json missing")
+        print(f"       fix_command: {fix_command}")
 else:
     print(f"  error_type '{error_type}' — file patch not automated for this type")
     print(f"  Manual fix required: {fix_command}")
@@ -183,7 +202,10 @@ print(f"  {DIVIDER}")
 print("  Pushing branch")
 print(f"  {DIVIDER}")
 
-run(["git", "push", "origin", branch, "--force-with-lease"])
+# --force: safe for ephemeral AI-generated fix branches — no shared work on them.
+# --force-with-lease was rejected ("stale info") because actions/checkout pre-fetches
+# remote branches, causing the lease expectation to mismatch on re-runs.
+run(["git", "push", "origin", branch, "--force"])
 kv("Pushed", f"origin/{branch}")
 
 

@@ -280,14 +280,7 @@ Return ONLY valid JSON with exactly these keys:
   "fix_command": "exact command or code change — must be copy-paste ready",
   "severity": "low | medium | high",
   "confidence": "high | medium | low",
-  "pr_title": "fix: short title under 72 chars",
-  "dependency_updates": {{
-    "description": "only populate for npm-dependency errors — leave empty object {{}} for all other error types",
-    "packages": [
-      {{"name": "react", "from": "17.0.2", "to": "18.0.0"}},
-      {{"name": "react-dom", "from": "18.0.0", "to": "18.0.0"}}
-    ]
-  }}
+  "pr_title": "fix: short title under 72 chars"
 }}
 
 CI failure log (extracted error lines only — {extracted_tokens} tokens):
