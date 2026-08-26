@@ -6,7 +6,6 @@ on:
 
 jobs:
   # ─── Job 1: Build ────────────────────────────────────────────────────────────
-  # Intentionally fails: react@17 + react-dom@18 = ERESOLVE peer conflict
   build:
     name: build
     runs-on: ubuntu-latest
@@ -19,13 +18,14 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install dependencies (will fail — peer conflict)
+      - name: Install dependencies
         run: npm install
 
   # ─── Job 2: AI Failure Analyzer ──────────────────────────────────────────────
-  # Only runs when build fails (if: failure()).
-  # Two steps in one job — files persist between steps, no artifact upload needed.
-  # If Step 1 fails, Step 2 is automatically skipped.
+  # Triggered only when the build job fails (if: failure()).
+  # Two steps in one job so the log file written in Step 1 is available to Step 2
+  # without needing artifact upload/download between jobs.
+  # If Step 1 (analysis) fails, Step 2 (PR creation) is automatically skipped.
   analyze-failure:
     name: analyze-failure
     needs: build

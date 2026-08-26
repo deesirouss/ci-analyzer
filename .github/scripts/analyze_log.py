@@ -1,21 +1,21 @@
 """
-Step 1 of 2 — CI Log Analysis
+CI Failure Analyzer — Step 1 of 2: Log Analysis
+
 Runs inside the 'analyze-failure' job, Step 1.
 
 Applies:
-  Day 02 — Token economics: extract error lines only, print savings
+  Day 02 — Token economics: extract error lines only, print savings vs full log
   Day 03 — Structured output: Gemini returns JSON (response_mime_type=application/json)
-  Day 05 — RAG: keyword-scored knowledge base mirrors ChromaDB search_similar_failures
+  Day 05 — RAG: keyword-scored knowledge base (mirrors ChromaDB search_similar_failures)
 
-Pipeline (all deterministic — no AI orchestration needed here):
-  1. read_log_file           → extract error lines, print token savings
-  2. search_similar_failures → score against knowledge base, return best match
-  3. analyze + draft (combined) → ONE Gemini call returns both structured JSON
-                                   analysis AND the pr_description Markdown string
-                                   Day 02: 1 call instead of 2 halves quota usage
+Pipeline (deterministic — no AI orchestration):
+  1. read_log_file            → extract error lines, compute token savings
+  2. search_similar_failures  → score against knowledge base, return best match
+  3. call_gemini              → ONE call returns structured JSON analysis AND
+                                pr_description Markdown (combined to halve API usage)
+  4. write analysis.json      → consumed by create_pr.py in Step 2
 
-Writes: analysis.json (read by create_pr.py in Step 2)
-No git or GitHub operations happen here.
+No git or GitHub operations occur in this file.
 """
 
 import json
@@ -26,62 +26,91 @@ import sys
 import time
 import warnings
 
-# Suppress the google-genai SDK's AFC warning — it fires on import even when
-# not using AFC. We call models.generate_content() directly (one-shot, no tools).
+# Suppress AFC warning: fires on import even when AFC is not used.
+# We call models.generate_content() directly — stateless, one-shot, no tools.
 warnings.filterwarnings("ignore", message=".*automatic function calling.*")
 
 from google import genai
 from google.genai import types
 
-CHARS_PER_TOKEN = 4  # ~4 chars per token — Day 02 estimation rule
+
+# ─── Configuration ─────────────────────────────────────────────────────────────
+
+CHARS_PER_TOKEN = 4  # rough estimate: 1 token ≈ 4 chars
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RUN_ID = os.environ.get("RUN_ID", "unknown")
 LOG_FILE = "ci_failure.log"
 ANALYSIS_FILE = "analysis.json"
-# Model priority list — automatic fallback if primary hits daily RPD quota.
-# Primary: set via GitHub Actions Variable GEMINI_MODEL (plain text, visible in UI).
-# To change: Repo → Settings → Secrets and variables → Actions → Variables → GEMINI_MODEL
+
+# Model priority list — if the primary model hits its daily RPD quota,
+# the next model in the list is tried automatically.
+# Override the primary via GitHub Actions Variable GEMINI_MODEL (plain text,
+# visible in the UI — not a Secret):
+# Repo → Settings → Secrets and variables → Actions → Variables → GEMINI_MODEL
 #
-# Free-tier API model IDs (confirmed working, from AI Studio dashboard):
-#   gemini-3.1-flash-lite   500 RPD, 15 RPM   ← default primary (25× more daily calls)
+# Confirmed free-tier API model IDs (from AI Studio dashboard):
+#   gemini-3.1-flash-lite   500 RPD, 15 RPM   ← default primary
 #   gemini-3.5-flash-lite   500 RPD, 15 RPM   ← fallback 1
-#   gemini-3.5-flash         20 RPD,  5 RPM   ← fallback 2 (last resort)
+#   gemini-3.5-flash         20 RPD,  5 RPM   ← fallback 2
 #   gemini-3.6-flash         20 RPD,  5 RPM   ← fallback 3
 _env_model = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
-_candidates = [_env_model, "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash"]
+_candidates = [
+    _env_model,
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+]
 _seen: set = set()
 MODEL_PRIORITY = [m for m in _candidates if m and not (m in _seen or _seen.add(m))]
 MODEL = MODEL_PRIORITY[0]
 
 DIVIDER = "─" * 62
 
-def header(step_num, title, day_tag=""):
-    tag = f"  [{day_tag}]" if day_tag else ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIDECAR — Display helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def header(step_num, title):
+    """Print a numbered step header to CI log output."""
     print(f"\n{'━' * 62}")
-    print(f"  STEP {step_num} — {title}{tag}")
+    print(f"  STEP {step_num} — {title}")
     print(f"{'━' * 62}")
 
 
 def kv(key, value, indent=2):
-    print(f"{' ' * indent}{key:<18}: {value}")
+    """Print a key-value pair with aligned columns for CI log readability."""
+    print(f"{' ' * indent}{key:<20}: {value}")
 
 
-if not GEMINI_API_KEY:
-    print("ERROR: GEMINI_API_KEY is not set. Add it as a GitHub Actions secret.")
-    sys.exit(1)
-
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-print(f"{'━' * 62}")
-print(f"  CI FAILURE ANALYZER — Log Analysis")
-print(f"  Model: {MODEL}  |  Run: {RUN_ID}")
-print(f"{'━' * 62}")
-
-
-# ─── Retry (catches 429 rate limit AND 503 server overload) ──────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIDECAR — Gemini API retry handler
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def with_retry(fn, label="Gemini", max_retries=5):
+    """
+    Call fn() and retry on transient Gemini API errors.
+
+    Handles per-minute rate limits (429 RPM) and server overload (503).
+    Does NOT catch daily quota exhaustion (RPD) — that triggers a model switch
+    in the caller, not a retry of the same model.
+
+    When the API response includes a "retry in Xs" hint, that exact wait time
+    is used (plus a 2-second buffer). Otherwise, exponential backoff is applied.
+
+    Args:
+        fn:          zero-argument callable that makes the API call
+        label:       identifier shown in log output
+        max_retries: maximum attempts before re-raising the last exception
+
+    Returns:
+        The return value of fn() on success.
+
+    Raises:
+        The last exception if all retries are exhausted.
+    """
     for attempt in range(max_retries):
         try:
             return fn()
@@ -96,8 +125,6 @@ def with_retry(fn, label="Gemini", max_retries=5):
                 or "high demand" in err.lower()
             )
             if is_retryable and attempt < max_retries - 1:
-                # Respect the API's own retry-after value if present.
-                # e.g. "Please retry in 38.572298888s" — never ignore this.
                 m = re.search(r"retry in (\d+\.?\d*)s", err)
                 api_wait = float(m.group(1)) + 2.0 if m else None
                 wait = api_wait if api_wait else min(60.0, (2 ** attempt) + random.uniform(0, 1))
@@ -109,8 +136,14 @@ def with_retry(fn, label="Gemini", max_retries=5):
     raise RuntimeError(f"{label} failed after {max_retries} retries")
 
 
-# ─── Embedded knowledge base (mirrors Day 05 ChromaDB collection) ────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN — Knowledge base of known CI failure patterns
+# ═══════════════════════════════════════════════════════════════════════════════
 
+# Each entry captures a class of CI failure: the keywords that identify it in
+# logs, a human-readable label, and the fix that resolved it historically.
+# This is queried in Step 2 before the model call — a knowledge base hit injects
+# the proven fix into the prompt, improving both accuracy and fix quality.
 KNOWN_FAILURES = [
     {
         "keywords": ["eresolve", "peer", "dependency", "npm", "react"],
@@ -119,7 +152,7 @@ KNOWN_FAILURES = [
         "past_fix": (
             "Align both packages to the same major version. "
             "Example: react@17 + react-dom@18 → both to react@18 + react-dom@18. "
-            "Avoid --legacy-peer-deps in production; it hides future conflicts."
+            "Avoid --legacy-peer-deps in production; it masks conflicts that resurface later."
         ),
     },
     {
@@ -160,6 +193,8 @@ KNOWN_FAILURES = [
     },
 ]
 
+# Regex to identify lines carrying error signal in a CI log.
+# Used in Step 1 to extract only the relevant lines before sending to the model.
 ERROR_PATTERNS = re.compile(
     r"(error|err |failed|failure|exception|traceback|exit code [^0]|"
     r"cannot|fatal|eresolve|enoent|permission denied|warn deprecated)",
@@ -167,15 +202,149 @@ ERROR_PATTERNS = re.compile(
 )
 
 
-# ─── Step 1: Log extraction ───────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN — Knowledge base search
+# ═══════════════════════════════════════════════════════════════════════════════
 
-header(1, "Log Extraction", "Day 02: Token Economics")
+def search_similar_failures(log_text):
+    """
+    Find the closest matching past failure in KNOWN_FAILURES for the given log.
+
+    Uses deterministic keyword extraction from specific error signals (no AI
+    call) to form a search query, then scores each KNOWN_FAILURES entry by how
+    many of its keywords appear in the query. The highest-scoring entry above a
+    minimum threshold is returned as the match.
+
+    Keeping this step deterministic (rather than delegating to the model) ensures
+    reproducible results and avoids consuming an additional API call.
+
+    Args:
+        log_text: extracted error lines from the CI log (already filtered)
+
+    Returns:
+        dict with keys:
+          matched (bool), similarity (float 0–1), score (str "x/y"),
+          error (str), category (str), past_fix (str)
+        If no match is found: {"matched": False, "similarity": 0.0}
+    """
+    lower = log_text.lower()
+
+    # Map known error signals to targeted search queries.
+    # Explicit signal matching is more reliable than generic full-text search
+    # for the structured failure patterns we track.
+    if "eresolve" in lower or ("peer" in lower and "npm" in lower):
+        query = "npm peer dependency eresolve conflict react"
+    elif "cannotpull" in lower or ("ecr" in lower and "ecs" in lower):
+        query = "ecr cannotpull container image ecs private subnet nat"
+    elif "modulenotfounderror" in lower:
+        query = "pytest modulenotfounderror venv activate"
+    elif "resource not accessible" in lower or ("403" in lower and "pull-request" in lower):
+        query = "github actions 403 resource not accessible pull-requests github_token"
+    elif "connection refused" in lower and "5432" in lower:
+        query = "postgres connection refused 5432 service container"
+    else:
+        for line in log_text.splitlines():
+            stripped = line.strip()
+            if stripped:
+                query = stripped[:100]
+                break
+        else:
+            query = "ci pipeline failure"
+
+    kv("Query", query)
+
+    best_match = None
+    best_score = 0
+    for entry in KNOWN_FAILURES:
+        score = sum(1 for k in entry["keywords"] if k in query.lower())
+        if score > best_score:
+            best_score = score
+            best_match = entry
+
+    if best_match and best_score >= 1:
+        max_keywords = len(best_match["keywords"])
+        similarity = round(best_score / max_keywords, 2)
+        kv("Match", f"{best_match['error']} [{best_match['category']}]")
+        kv("Similarity", f"{similarity} (score {best_score}/{max_keywords} keywords)")
+        kv("Past fix", best_match["past_fix"][:90] + ("..." if len(best_match["past_fix"]) > 90 else ""))
+        return {
+            "matched": True,
+            "similarity": similarity,
+            "score": f"{best_score}/{max_keywords}",
+            "error": best_match["error"],
+            "category": best_match["category"],
+            "past_fix": best_match["past_fix"],
+        }
+
+    kv("Match", "None found in knowledge base")
+    return {"matched": False, "similarity": 0.0}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN — Gemini API call
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def call_gemini(model, prompt):
+    """
+    Send the analysis prompt to Gemini and return the raw response object.
+
+    Uses response_mime_type=application/json to instruct the model to return
+    only valid JSON. The system instruction reinforces this constraint.
+
+    A single call returns both the structured analysis fields (error_type,
+    root_cause, fix_command, etc.) AND the PR description as an embedded
+    Markdown string — one call instead of two separate analyze/draft calls.
+
+    Args:
+        model:  Gemini API model ID string (e.g. "gemini-3.1-flash-lite")
+        prompt: the fully assembled prompt string including log content and
+                any knowledge base context
+
+    Returns:
+        google.genai response object; access the result via .text
+    """
+    return client.models.generate_content(
+        model=model,
+        config=types.GenerateContentConfig(
+            system_instruction=(
+                "You are a Senior DevOps Solutions Architect. "
+                "Return ONLY a valid JSON object. No markdown fences, no text outside the JSON."
+            ),
+            response_mime_type="application/json",
+        ),
+        contents=prompt,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if not GEMINI_API_KEY:
+    print("ERROR: GEMINI_API_KEY is not set. Add it as a GitHub Actions secret.")
+    sys.exit(1)
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+print(f"{'━' * 62}")
+print(f"  CI FAILURE ANALYZER — Log Analysis")
+print(f"  Model: {MODEL}  |  Run: {RUN_ID}")
+print(f"{'━' * 62}")
+
+
+# ─── Step 1: Log extraction ───────────────────────────────────────────────────
+# Read the full CI log and extract only lines that carry error signal.
+# Sending the full log to the model wastes tokens and buries the key error.
+# We keep each matching line plus one line of context above it — the preceding
+# line often identifies which step or command produced the error.
+
+header(1, "Log Extraction")
 
 try:
     with open(LOG_FILE, "r", errors="replace") as f:
         lines = f.readlines()
 except FileNotFoundError:
-    print(f"  ERROR: {LOG_FILE} not found. Did the download step run?")
+    print(f"  ERROR: {LOG_FILE} not found. Did the log download step complete?")
     sys.exit(1)
 
 full_chars = sum(len(l) for l in lines)
@@ -190,7 +359,7 @@ for i, line in enumerate(lines):
 
 extracted_lines = [lines[i] for i in sorted(kept_indices)]
 if len(extracted_lines) > 80:
-    extracted_lines = extracted_lines[-80:]
+    extracted_lines = extracted_lines[-80:]  # keep the most recent errors
 
 extracted = "".join(extracted_lines)
 extracted_chars = len(extracted)
@@ -213,83 +382,21 @@ print(f"  {DIVIDER}")
 
 
 # ─── Step 2: Knowledge base search ───────────────────────────────────────────
+# Query the knowledge base for similar past failures before calling the model.
+# When a match is found, the proven fix is injected into the model prompt,
+# which significantly improves root cause accuracy and fix quality.
 
-header(2, "Knowledge Base Search", "Day 05: RAG")
-
-# Deterministic query extraction — no AI needed to figure out what to search
-extracted_lower = extracted.lower()
-if "eresolve" in extracted_lower or ("peer" in extracted_lower and "npm" in extracted_lower):
-    kb_query = "npm peer dependency eresolve conflict react"
-elif "cannotpull" in extracted_lower or ("ecr" in extracted_lower and "ecs" in extracted_lower):
-    kb_query = "ecr cannotpull container image ecs private subnet nat"
-elif "modulenotfounderror" in extracted_lower:
-    kb_query = "pytest modulenotfounderror venv activate"
-elif "resource not accessible" in extracted_lower or ("403" in extracted_lower and "pull-request" in extracted_lower):
-    kb_query = "github actions 403 resource not accessible pull-requests github_token"
-elif "connection refused" in extracted_lower and "5432" in extracted_lower:
-    kb_query = "postgres connection refused 5432 service container"
-else:
-    # Fallback: first error-looking line
-    for line in extracted_lines:
-        stripped = line.strip()
-        if stripped:
-            kb_query = stripped[:100]
-            break
-    else:
-        kb_query = "ci pipeline failure"
-
-kv("Query", kb_query)
-
-best_match = None
-best_score = 0
-for entry in KNOWN_FAILURES:
-    score = sum(1 for k in entry["keywords"] if k in kb_query.lower())
-    if score > best_score:
-        best_score = score
-        best_match = entry
-
-if best_match and best_score >= 1:
-    max_keywords = len(best_match["keywords"])
-    similarity = round(best_score / max_keywords, 2)
-    kv("Match", f"{best_match['error']} [{best_match['category']}]")
-    kv("Similarity", f"{similarity} (score {best_score}/{max_keywords} keywords)")
-    kv("Past fix", best_match["past_fix"][:90] + ("..." if len(best_match["past_fix"]) > 90 else ""))
-    kb_result = {
-        "matched": True,
-        "similarity": similarity,
-        "score": f"{best_score}/{max_keywords}",
-        "error": best_match["error"],
-        "category": best_match["category"],
-        "past_fix": best_match["past_fix"],
-    }
-else:
-    kv("Match", "None found in knowledge base")
-    kb_result = {"matched": False, "similarity": 0.0}
+header(2, "Knowledge Base Search")
+kb_result = search_similar_failures(extracted)
 
 
-# ─── Step 3: Root cause analysis ─────────────────────────────────────────────
+# ─── Step 3: Root cause analysis + PR description ────────────────────────────
+# One Gemini call returns both the structured analysis (JSON fields) and the
+# ready-to-use PR description (Markdown string embedded in the JSON).
+# Combining both outputs into a single call avoids an extra API request.
 
-header(3, "Root Cause Analysis", "Day 03: Structured Output")
+header(3, "Root Cause Analysis + PR Description")
 
-past_context = ""
-if kb_result.get("matched"):
-    past_context = (
-        f"\nKnowledge base match (similarity: {kb_result['similarity']}):\n"
-        f"Past failure: {kb_result['error']} [{kb_result['category']}]\n"
-        f"Proven fix: {kb_result['past_fix']}"
-    )
-
-# ─── Steps 3 + 4 combined: ONE Gemini call ───────────────────────────────────
-# Day 02 principle: minimise API calls, not just tokens.
-# Two separate calls (analyze → draft) consumed 2 of 20 free-tier daily requests.
-# One combined call returns both the structured analysis AND the PR description.
-# The pr_description is a Markdown string embedded in the JSON response.
-
-header(3, "Root Cause Analysis + PR Description (combined)", "Day 02+03: 1 call, 2 outputs")
-
-low_confidence_note = (
-    "\n- If confidence must be low, add a `low_confidence_warning` field explaining why."
-)
 rag_note = (
     f"\nKnowledge base match (similarity: {kb_result['similarity']}):\n"
     f"Past failure: {kb_result['error']} [{kb_result['category']}]\n"
@@ -324,42 +431,27 @@ Rules for pr_description:
 - Reference the knowledge base match if present (similarity score + proven fix)
 - Add a low confidence warning section if confidence is low
 - End with exactly: ⚠️ This fix was proposed by AI analysis. Review before merging.
-- Keep under 250 words{low_confidence_note}
+- Keep under 250 words
 
 CI failure log (extracted error lines only — {extracted_tokens} tokens):
 {extracted}
 {rag_note}"""
 
 prompt_tokens = len(combined_prompt) // CHARS_PER_TOKEN
-kv("Sending to Gemini", f"~{prompt_tokens} tokens  (analysis + PR body in one call)")
-kv("Includes RAG context", str(kb_result.get("matched", False)))
-kv("Gemini calls", "1  (was 2 — halves daily quota usage)")
+kv("Sending to Gemini", f"~{prompt_tokens} tokens")
+kv("Includes KB context", str(kb_result.get("matched", False)))
 kv("Model priority", " → ".join(MODEL_PRIORITY))
 
-
-def call_combined(model):
-    return client.models.generate_content(
-        model=model,
-        config=types.GenerateContentConfig(
-            system_instruction=(
-                "You are a Senior DevOps Solutions Architect. "
-                "Return ONLY a valid JSON object. No markdown fences, no text outside the JSON."
-            ),
-            response_mime_type="application/json",
-        ),
-        contents=combined_prompt,
-    )
-
-
-# Try each model in priority order. If a model hits its daily RPD quota, move to the next.
-# RPM rate limits (too many requests per minute) retry the SAME model — daily quota switches model.
+# Try each model in priority order.
+# Per-minute rate limits (RPM) → with_retry() waits and retries the same model.
+# Per-day quota exhaustion (RPD) → detected here, switches to the next model.
 response = None
 used_model = None
 for _model in MODEL_PRIORITY:
     print(f"  Calling {_model}...")
     try:
         response = with_retry(
-            (lambda m: lambda: call_combined(m))(_model),
+            (lambda m: lambda: call_gemini(m, combined_prompt))(_model),
             label=f"analyze+draft[{_model}]",
         )
         used_model = _model
@@ -378,9 +470,11 @@ if response is None:
 
 if used_model != MODEL:
     kv("Fallback used", f"{used_model}  (primary {MODEL} hit daily quota)")
+
 raw = response.text.strip()
 
-# Strip code fences defensively
+# Strip markdown code fences defensively — some model versions include them
+# despite response_mime_type=application/json being set.
 if raw.startswith("```"):
     inner = raw.split("\n")[1:-1]
     raw = "\n".join(inner).strip()
@@ -412,7 +506,9 @@ print(f"  │ ...")
 print(f"  {DIVIDER}")
 
 
-# ─── Write analysis.json ─────────────────────────────────────────────────────
+# ─── Step 4: Write analysis.json ─────────────────────────────────────────────
+# Persist the full analysis as JSON for create_pr.py to consume in Step 2.
+# create_pr.py applies the fix and opens the PR without making any model calls.
 
 print()
 print(f"{'━' * 62}")
@@ -445,7 +541,7 @@ with open(ANALYSIS_FILE, "w") as f:
     json.dump(output, f, indent=2)
 
 kv("Written to", ANALYSIS_FILE)
-kv("Total Gemini calls", "1  (combined analyze + draft)")
+kv("Gemini calls", "1")
 kv("Tokens sent", f"~{prompt_tokens}")
 print()
 print("  ✅ Analysis complete. Passing to Step 2 (create_pr.py).")

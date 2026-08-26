@@ -1,18 +1,23 @@
 """
-Step 2 of 2 — Create Fix PR
-Runs inside the 'analyze-failure' job, Step 2.
-Only runs if Step 1 (analyze_log.py) succeeded.
+CI Failure Analyzer — Step 2 of 2: Create Fix PR
 
-No AI calls here. Reads analysis.json written by analyze_log.py.
+Runs inside the 'analyze-failure' job, Step 2.
+Only runs if Step 1 (analyze_log.py) succeeded and wrote analysis.json.
 
 What this does:
-  - Applies the actual file fix when possible (e.g. patches package.json for npm errors)
-  - Creates a branch named fix/{error_type}-{trigger_branch} — stable per error+branch combo
-  - Re-runs for the same issue on the same branch push to the SAME fix branch (no duplicate PRs)
-  - Opens a PR for human review — only the real file fix is committed, no analysis docs
+  1. Reads the structured analysis from analysis.json (no AI calls here)
+  2. Applies the file-level fix when possible (e.g. patches package.json for
+     npm dependency conflicts). Only the real fix file is committed — no
+     analysis docs, no metadata files.
+  3. Creates or updates a fix branch named fix/{error_type}-{trigger_branch}.
+     The branch name is stable per error+branch combination: re-runs for the
+     same issue on the same branch push to the same fix branch and update the
+     existing PR instead of opening a duplicate.
+  4. Opens a PR targeting the branch that triggered the workflow.
 
-Guardrail: AI proposes. Human reviews and merges. AI never auto-merges.
-Branch naming: fix/{error_type}-{trigger_branch}  e.g. fix/npm-dependency-main
+Guardrail: The AI proposes the fix. A human reviews and merges.
+This script never calls git merge, never pushes to the main branch directly,
+and never closes or merges its own PR.
 """
 
 import json
@@ -28,26 +33,60 @@ REPO = os.environ.get("REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "unknown")
 COMMIT_SHA = os.environ.get("COMMIT_SHA", "unknown")
 SHORT_SHA = COMMIT_SHA[:7]
-# Branch that triggered the workflow — PR targets this, fix branch merges from it.
-# Never hardcoded: works for main, develop, release/*, feature/* equally.
+# The branch that triggered the workflow — the PR targets this branch.
+# Never hardcoded: supports main, develop, release/*, feature/* without changes.
 TRIGGER_BRANCH = os.environ.get("TRIGGER_BRANCH", "main")
-# Sanitize for use in branch names: release/v2 → release-v2
+# Sanitize for use in branch names: "release/v2" → "release-v2"
 SAFE_TRIGGER = TRIGGER_BRANCH.replace("/", "-")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIDECAR — Shell and display helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def kv(key, value, indent=2):
+    """Print a key-value pair with aligned columns for CI log readability."""
     print(f"{' ' * indent}{key:<20}: {value}")
 
 
 def run(cmd, check=True, capture=False):
+    """
+    Run a shell command via subprocess.
+
+    Args:
+        cmd:     list of command tokens (e.g. ["git", "status"])
+        check:   if True (default), raises CalledProcessError on non-zero exit
+        capture: if True, captures stdout/stderr; returned on the CompletedProcess
+
+    Returns:
+        subprocess.CompletedProcess
+    """
     return subprocess.run(cmd, check=check, capture_output=capture, text=True)
 
 
-def _parse_npm_packages(fix_command: str) -> dict:
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN — Package version parser
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _parse_npm_packages(fix_command):
     """
-    Parse npm fix_command into {package_name: version}.
-    Handles: 'npm install react@18.0.0 react-dom@18.0.0 --save-exact'
-    Handles scoped packages: '@company/utils@1.2.3'
+    Parse an npm install command into a {package_name: version} dict.
+
+    Used to patch package.json directly rather than running npm install,
+    which avoids side effects and keeps the PR diff minimal and reviewable.
+
+    Handles standard and scoped packages:
+      "npm install react@18.0.0 react-dom@18.0.0 --save-exact"
+        → {"react": "18.0.0", "react-dom": "18.0.0"}
+      "npm install @company/utils@1.2.3"
+        → {"@company/utils": "1.2.3"}
+
+    Args:
+        fix_command: the fix_command string from analysis.json
+
+    Returns:
+        dict mapping package name → version string.
+        Empty dict if the command cannot be parsed or contains no versioned packages.
     """
     skip = {"npm", "install", "add", "i"}
     result = {}
@@ -56,17 +95,21 @@ def _parse_npm_packages(fix_command: str) -> dict:
             continue
         if part in skip:
             continue
-        # Scoped package: @scope/name@version
         if part.startswith("@") and part.count("@") >= 2:
+            # Scoped package: @scope/name@version — version follows the last @
             at_idx = part.rfind("@")
             result[part[:at_idx]] = part[at_idx + 1:]
-        # Regular package: name@version
         elif "@" in part:
+            # Regular package: name@version
             name, ver = part.rsplit("@", 1)
             if name:
                 result[name] = ver
     return result
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
 
 print(f"{'━' * 62}")
 print(f"  CI FAILURE ANALYZER — Create Fix PR")
@@ -74,7 +117,7 @@ print(f"  Commit: {SHORT_SHA}  |  Run: {RUN_ID}")
 print(f"{'━' * 62}")
 
 
-# ─── Read analysis from Step 1 ───────────────────────────────────────────────
+# ─── Step 5: Read analysis from Step 1 ───────────────────────────────────────
 
 print(f"\n{'━' * 62}")
 print(f"  STEP 5 — Create GitHub PR  [Guardrail: human reviews before merge]")
@@ -106,9 +149,9 @@ kv("fix_command", str(fix_command)[:80])
 kv("RAG match", f"{kb.get('error', 'none')} (similarity: {kb.get('similarity', 0)})" if kb.get("matched") else "none")
 kv("PR title", pr_title)
 
-# Branch name: fix/{error_type}-{trigger_branch} — stable per error+branch combo.
-# Same error on same trigger branch always uses the same fix branch.
-# Re-runs update the existing PR instead of creating a new one.
+# Branch name is stable per error+branch combination.
+# Re-runs of the same error on the same trigger branch always use the same
+# fix branch, so the existing PR is updated rather than a duplicate opened.
 branch = f"fix/{error_type}-{SAFE_TRIGGER}"
 kv("branch", branch)
 
@@ -124,7 +167,6 @@ run(["git", "config", "user.email", f"{GITHUB_ACTOR}@users.noreply.github.com"])
 run(["git", "config", "user.name", GITHUB_ACTOR])
 kv("git user", f"{GITHUB_ACTOR}@users.noreply.github.com")
 
-# Always fetch to see current remote state
 run(["git", "fetch", "origin"])
 
 remote_check = run(
@@ -136,7 +178,9 @@ branch_exists_on_remote = bool(remote_check.stdout.strip())
 kv("Base branch", TRIGGER_BRANCH)
 
 if branch_exists_on_remote:
-    # Pull existing branch, then merge the triggering branch so the PR always has current code
+    # Branch exists from a previous run of this same error.
+    # Pull it and merge the trigger branch to pick up commits that landed
+    # on the base since the fix branch was first created.
     run(["git", "checkout", branch])
     merge = run(["git", "merge", f"origin/{TRIGGER_BRANCH}", "--no-edit"], check=False, capture=True)
     if merge.returncode != 0:
@@ -145,15 +189,15 @@ if branch_exists_on_remote:
     else:
         kv("Branch", f"{branch} (exists — merged latest {TRIGGER_BRANCH} ✅)")
 else:
-    # Create fresh branch from the branch that triggered the workflow
     run(["git", "checkout", "-b", branch, f"origin/{TRIGGER_BRANCH}"])
     kv("Branch", f"{branch} (created from origin/{TRIGGER_BRANCH} ✅)")
 
 
-# ─── Apply the actual file fix ────────────────────────────────────────────────
-# For npm-dependency errors: patch package.json directly with corrected versions.
-# For other error types: commit the analysis doc only — human applies the fix.
-# The PR diff should show the REAL change, not just a description of it.
+# ─── Apply the file fix ───────────────────────────────────────────────────────
+# For known error types, patch the affected file directly from fix_command.
+# Only the patched file is committed — the PR description carries the full
+# analysis context. For error types without an automated patch, the PR
+# description guides the reviewer to apply the fix manually.
 
 print()
 print(f"  {DIVIDER}")
@@ -186,13 +230,14 @@ if error_type == "npm-dependency":
             files_changed.append("package.json")
             print(f"  package.json updated and staged ✅")
         else:
-            print(f"  ⚠️  Packages from fix_command not found in package.json — analysis only")
+            print(f"  ⚠️  Packages from fix_command not found in package.json")
+            print(f"       fix_command: {fix_command}")
     else:
         print(f"  ⚠️  Could not parse packages from fix_command or package.json missing")
         print(f"       fix_command: {fix_command}")
 else:
-    print(f"  error_type '{error_type}' — file patch not automated for this type")
-    print(f"  Manual fix required: {fix_command}")
+    print(f"  error_type '{error_type}' — no automated file patch for this type")
+    print(f"  Manual fix: {fix_command}")
     print(f"  Affected file: {affected_file}")
 
 
@@ -203,15 +248,13 @@ print(f"  {DIVIDER}")
 print("  Committing")
 print(f"  {DIVIDER}")
 
-# Only commit the actual file fix. The PR description carries all the context.
-# Never commit ci_analysis.md or other markdown docs — they corrupt the repo diff.
 diff = run(["git", "diff", "--cached", "--quiet"], check=False)
 if diff.returncode != 0:
     commit_msg = f"fix(ci): {error_type} fix for commit {SHORT_SHA}\n\nAI-generated analysis — run {RUN_ID}"
     run(["git", "commit", "-m", commit_msg])
     kv("Committed", ", ".join(files_changed) if files_changed else "(no files)")
 else:
-    kv("Committed", "no staged changes — PR will describe the fix, human applies it")
+    kv("Committed", "no staged changes — PR description describes the fix, human applies it")
 
 
 # ─── Push ─────────────────────────────────────────────────────────────────────
@@ -221,13 +264,13 @@ print(f"  {DIVIDER}")
 print("  Pushing branch")
 print(f"  {DIVIDER}")
 
-# No force push needed — branch is always built from or merged with origin/main,
-# so local is always ahead of or equal to remote.
+# No force push required: the branch is always built from or merged with
+# origin/{TRIGGER_BRANCH}, so the local tip is always ahead of or equal to remote.
 run(["git", "push", "origin", branch])
 kv("Pushed", f"origin/{branch}")
 
 
-# ─── Create PR ────────────────────────────────────────────────────────────────
+# ─── Create or identify existing PR ──────────────────────────────────────────
 
 print()
 print(f"  {DIVIDER}")
@@ -244,10 +287,10 @@ existing_text = existing.stdout.strip()
 if existing_text and existing_text != "null":
     try:
         ex = json.loads(existing_text)
-        kv("Status", f"already exists (re-run)")
+        kv("Status", "already exists — updated by latest push")
         kv("PR", f"#{ex.get('number')}  {ex.get('url', '')}")
         print()
-        print("  ✅ PR already exists. Human review required before merging.")
+        print("  ✅ PR updated. Human review required before merging.")
         sys.exit(0)
     except (json.JSONDecodeError, KeyError):
         pass
@@ -276,5 +319,5 @@ if pr_result.returncode == 0:
 else:
     error_msg = pr_result.stderr.strip()
     kv("Status", "FAILED ❌")
-    kv("Error", error_msg[:120])
+    kv("Error", error_msg)
     sys.exit(1)
