@@ -88,7 +88,7 @@ def with_retry(fn, label="Gemini", max_retries=5):
                 m = re.search(r"retry in (\d+\.?\d*)s", err)
                 api_wait = float(m.group(1)) + 2.0 if m else None
                 wait = api_wait if api_wait else min(60.0, (2 ** attempt) + random.uniform(0, 1))
-                print(f"  ⚠️  {label} error (attempt {attempt + 1}/{max_retries}): {err[:120]}")
+                print(f"  ⚠️  {label} error (attempt {attempt + 1}/{max_retries}): {err}")
                 print(f"  ⏳ Retrying in {wait:.1f}s{'  ← API-specified wait' if api_wait else ''}...")
                 time.sleep(wait)
             else:
