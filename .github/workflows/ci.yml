@@ -8,7 +8,7 @@ on:
 
 jobs:
   # ─── Job 1: Build ────────────────────────────────────────────────────────────
-  # This job intentionally fails: react@17 + react-dom@18 = ERESOLVE
+  # Intentionally fails: react@17 + react-dom@18 = ERESOLVE peer conflict
   build:
     name: build
     runs-on: ubuntu-latest
@@ -25,9 +25,9 @@ jobs:
         run: npm install
 
   # ─── Job 2: AI Failure Analyzer ──────────────────────────────────────────────
-  # Only runs when build fails. Mirrors Day 06 Lab 2 (Gemini cloud agent).
-  # Tools: read_log_file → search_similar_failures → analyze_root_cause
-  #         → draft_pr_description → create_github_pr
+  # Only runs when build fails (if: failure()).
+  # Two steps in one job — files persist between steps, no artifact upload needed.
+  # If Step 1 fails, Step 2 is automatically skipped.
   analyze-failure:
     name: analyze-failure
     needs: build
@@ -46,7 +46,7 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install google-genai
+      - name: Install dependencies
         run: pip install google-genai==2.20.0
 
       - name: Download failed build job logs
@@ -64,13 +64,24 @@ jobs:
             > ci_failure.log
 
           echo "Log downloaded: $(wc -l < ci_failure.log) lines"
-          tail -20 ci_failure.log
 
-      - name: Run AI analysis and create PR
+      # ── Step 1: AI analysis (Tools 1–4) ──────────────────────────────────────
+      # Extracts error lines → searches knowledge base → Gemini analysis → Gemini PR draft
+      # Writes analysis.json — read by Step 2.
+      # If this step fails, Step 2 is automatically skipped.
+      - name: "Step 1 — AI Log Analysis (RAG + Gemini)"
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          RUN_ID: ${{ github.run_id }}
+        run: python3 .github/scripts/analyze_log.py
+
+      # ── Step 2: Create PR (Tool 5) ────────────────────────────────────────────
+      # Pure git + GitHub CLI. No AI calls. Reads analysis.json from Step 1.
+      # GEMINI_API_KEY not needed here — better secrets hygiene.
+      - name: "Step 2 — Create Fix PR (git + gh)"
+        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ github.run_id }}
           REPO: ${{ github.repository }}
           GITHUB_ACTOR: ${{ github.actor }}
-        run: python3 .github/scripts/analyze_and_pr.py
+        run: python3 .github/scripts/create_pr.py
