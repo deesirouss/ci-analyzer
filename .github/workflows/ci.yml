@@ -3,8 +3,6 @@ name: CI + AI Failure Analyzer
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
 
 jobs:
   # ─── Job 1: Build ────────────────────────────────────────────────────────────
