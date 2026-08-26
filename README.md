@@ -57,11 +57,27 @@ This gives Gemini a real, specific error to analyze and a concrete fix to propos
 |-----------|---------|
 | Python | 3.14 |
 | google-genai | 2.20.0 |
-| Gemini model | gemini-2.0-flash |
 | Node.js | 24 LTS |
 | actions/checkout | v7.0.1 |
 | actions/setup-python | v7.0.0 |
 | actions/setup-node | v7.0.0 |
+
+## Gemini Model Options (Free Tier)
+
+The model is configured via a GitHub Actions **Variable** (plain text, visible in UI — not a Secret).
+
+**To change:** Repo → Settings → Secrets and variables → Actions → **Variables** tab → `GEMINI_MODEL`
+
+If the primary model hits its daily RPD quota, the analyzer automatically falls back to the next model in the priority list. No manual intervention needed.
+
+| API Model ID | RPD (free) | RPM | Notes |
+|---|---|---|---|
+| `gemini-3.1-flash-lite` | **500** | 15 | Default primary — 25× more daily calls |
+| `gemini-3.5-flash-lite` | **500** | 15 | Fallback 1 |
+| `gemini-3.5-flash` | 20 | 5 | Fallback 2 |
+| `gemini-3.6-flash` | 20 | 5 | Fallback 3 (original model) |
+
+> These API model IDs are confirmed working. Display names in the AI Studio dashboard differ (e.g., "Gemini 3.1 Flash Lite" = `gemini-3.1-flash-lite`).
 
 ## Guardrail
 

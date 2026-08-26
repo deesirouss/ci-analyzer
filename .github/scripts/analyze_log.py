@@ -39,10 +39,20 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RUN_ID = os.environ.get("RUN_ID", "unknown")
 LOG_FILE = "ci_failure.log"
 ANALYSIS_FILE = "analysis.json"
-# Model is set via GitHub Actions Variable GEMINI_MODEL (plain text, visible in UI).
+# Model priority list — automatic fallback if primary hits daily RPD quota.
+# Primary: set via GitHub Actions Variable GEMINI_MODEL (plain text, visible in UI).
 # To change: Repo → Settings → Secrets and variables → Actions → Variables → GEMINI_MODEL
-# Default: gemini-3.1-flash-lite (500 RPD free tier — 25× more than gemini-3.6-flash's 20 RPD)
-MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+#
+# Free-tier API model IDs (confirmed working, from AI Studio dashboard):
+#   gemini-3.1-flash-lite   500 RPD, 15 RPM   ← default primary (25× more daily calls)
+#   gemini-3.5-flash-lite   500 RPD, 15 RPM   ← fallback 1
+#   gemini-3.5-flash         20 RPD,  5 RPM   ← fallback 2 (last resort)
+#   gemini-3.6-flash         20 RPD,  5 RPM   ← fallback 3
+_env_model = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+_candidates = [_env_model, "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash"]
+_seen: set = set()
+MODEL_PRIORITY = [m for m in _candidates if m and not (m in _seen or _seen.add(m))]
+MODEL = MODEL_PRIORITY[0]
 
 DIVIDER = "─" * 62
 
@@ -324,11 +334,12 @@ prompt_tokens = len(combined_prompt) // CHARS_PER_TOKEN
 kv("Sending to Gemini", f"~{prompt_tokens} tokens  (analysis + PR body in one call)")
 kv("Includes RAG context", str(kb_result.get("matched", False)))
 kv("Gemini calls", "1  (was 2 — halves daily quota usage)")
-print(f"  Calling {MODEL}...")
+kv("Model priority", " → ".join(MODEL_PRIORITY))
 
-def call_combined():
+
+def call_combined(model):
     return client.models.generate_content(
-        model=MODEL,
+        model=model,
         config=types.GenerateContentConfig(
             system_instruction=(
                 "You are a Senior DevOps Solutions Architect. "
@@ -339,7 +350,34 @@ def call_combined():
         contents=combined_prompt,
     )
 
-response = with_retry(call_combined, label="analyze+draft")
+
+# Try each model in priority order. If a model hits its daily RPD quota, move to the next.
+# RPM rate limits (too many requests per minute) retry the SAME model — daily quota switches model.
+response = None
+used_model = None
+for _model in MODEL_PRIORITY:
+    print(f"  Calling {_model}...")
+    try:
+        response = with_retry(
+            (lambda m: lambda: call_combined(m))(_model),
+            label=f"analyze+draft[{_model}]",
+        )
+        used_model = _model
+        break
+    except Exception as e:
+        err = str(e)
+        is_daily_quota = "PerDay" in err or "GenerateRequestsPerDay" in err
+        if is_daily_quota and _model != MODEL_PRIORITY[-1]:
+            print(f"  ⚠️  {_model}: daily RPD quota exhausted — switching to next model...")
+            continue
+        raise
+
+if response is None:
+    print(f"  ❌  All models exhausted their daily quota: {MODEL_PRIORITY}")
+    sys.exit(1)
+
+if used_model != MODEL:
+    kv("Fallback used", f"{used_model}  (primary {MODEL} hit daily quota)")
 raw = response.text.strip()
 
 # Strip code fences defensively
@@ -383,7 +421,7 @@ print(f"{'━' * 62}")
 
 output = {
     "run_id": RUN_ID,
-    "model": MODEL,
+    "model": used_model,
     "error_type": analysis.get("error_type"),
     "root_cause": analysis.get("root_cause"),
     "affected_file": analysis.get("affected_file"),
