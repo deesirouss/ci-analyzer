@@ -7,12 +7,12 @@ No AI calls here. Reads analysis.json written by analyze_log.py.
 
 What this does:
   - Applies the actual file fix when possible (e.g. patches package.json for npm errors)
-  - Creates a branch named fix/{error_type}-{short_sha} — traceable to the failing commit
-  - Commits the real fix + analysis document
-  - Opens a PR for human review
+  - Creates a branch named fix/{error_type}-{trigger_branch} — stable per error+branch combo
+  - Re-runs for the same issue on the same branch push to the SAME fix branch (no duplicate PRs)
+  - Opens a PR for human review — only the real file fix is committed, no analysis docs
 
 Guardrail: AI proposes. Human reviews and merges. AI never auto-merges.
-Branch naming: fix/{error_type}-{commit_sha[:7]}  e.g. fix/npm-dependency-aa6158f
+Branch naming: fix/{error_type}-{trigger_branch}  e.g. fix/npm-dependency-main
 """
 
 import json
@@ -31,6 +31,8 @@ SHORT_SHA = COMMIT_SHA[:7]
 # Branch that triggered the workflow — PR targets this, fix branch merges from it.
 # Never hardcoded: works for main, develop, release/*, feature/* equally.
 TRIGGER_BRANCH = os.environ.get("TRIGGER_BRANCH", "main")
+# Sanitize for use in branch names: release/v2 → release-v2
+SAFE_TRIGGER = TRIGGER_BRANCH.replace("/", "-")
 
 
 def kv(key, value, indent=2):
@@ -104,8 +106,10 @@ kv("fix_command", str(fix_command)[:80])
 kv("RAG match", f"{kb.get('error', 'none')} (similarity: {kb.get('similarity', 0)})" if kb.get("matched") else "none")
 kv("PR title", pr_title)
 
-# Branch name: fix/{error_type}-{short_sha} — traceable to the failing commit
-branch = f"fix/{error_type}-{SHORT_SHA}"
+# Branch name: fix/{error_type}-{trigger_branch} — stable per error+branch combo.
+# Same error on same trigger branch always uses the same fix branch.
+# Re-runs update the existing PR instead of creating a new one.
+branch = f"fix/{error_type}-{SAFE_TRIGGER}"
 kv("branch", branch)
 
 
@@ -199,21 +203,15 @@ print(f"  {DIVIDER}")
 print("  Committing")
 print(f"  {DIVIDER}")
 
-# Always commit the analysis doc so the PR has context
-with open("ci_analysis.md", "w") as f:
-    f.write(f"# CI Failure Analysis — Run {RUN_ID}\n\n")
-    f.write(pr_description)
-
-run(["git", "add", "ci_analysis.md"])
-files_changed.append("ci_analysis.md")
-
+# Only commit the actual file fix. The PR description carries all the context.
+# Never commit ci_analysis.md or other markdown docs — they corrupt the repo diff.
 diff = run(["git", "diff", "--cached", "--quiet"], check=False)
 if diff.returncode != 0:
     commit_msg = f"fix(ci): {error_type} fix for commit {SHORT_SHA}\n\nAI-generated analysis — run {RUN_ID}"
     run(["git", "commit", "-m", commit_msg])
-    kv("Committed", ", ".join(files_changed))
+    kv("Committed", ", ".join(files_changed) if files_changed else "(no files)")
 else:
-    kv("Committed", "no changes (re-run — skipping commit)")
+    kv("Committed", "no staged changes — PR will describe the fix, human applies it")
 
 
 # ─── Push ─────────────────────────────────────────────────────────────────────
@@ -271,7 +269,7 @@ if pr_result.returncode == 0:
     kv("Status", "created ✅")
     kv("PR URL", pr_url)
     kv("Branch", branch)
-    kv("Files in PR", ", ".join(files_changed))
+    kv("Files changed", ", ".join(files_changed) if files_changed else "none (description-only PR)")
     print()
     print("  ✅ PR created. Human review required before merging.")
     print("  ⚠️  This fix was proposed by AI analysis. Review before merging.")
