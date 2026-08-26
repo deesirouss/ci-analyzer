@@ -8,10 +8,11 @@ Applies:
   Day 05 — RAG: keyword-scored knowledge base mirrors ChromaDB search_similar_failures
 
 Pipeline (all deterministic — no AI orchestration needed here):
-  1. read_log_file        → extract error lines, print token savings
+  1. read_log_file           → extract error lines, print token savings
   2. search_similar_failures → score against knowledge base, return best match
-  3. analyze_root_cause   → Gemini call 1: structured JSON analysis
-  4. draft_pr_description → Gemini call 2: Markdown PR body
+  3. analyze + draft (combined) → ONE Gemini call returns both structured JSON
+                                   analysis AND the pr_description Markdown string
+                                   Day 02: 1 call instead of 2 halves quota usage
 
 Writes: analysis.json (read by create_pr.py in Step 2)
 No git or GitHub operations happen here.
@@ -82,9 +83,13 @@ def with_retry(fn, label="Gemini", max_retries=5):
                 or "high demand" in err.lower()
             )
             if is_retryable and attempt < max_retries - 1:
-                wait = min(60.0, (2 ** attempt) + random.uniform(0, 1))
-                print(f"  ⚠️  {label} error (attempt {attempt + 1}/{max_retries}): {err[:100]}")
-                print(f"  ⏳ Retrying in {wait:.1f}s...")
+                # Respect the API's own retry-after value if present.
+                # e.g. "Please retry in 38.572298888s" — never ignore this.
+                m = re.search(r"retry in (\d+\.?\d*)s", err)
+                api_wait = float(m.group(1)) + 2.0 if m else None
+                wait = api_wait if api_wait else min(60.0, (2 ** attempt) + random.uniform(0, 1))
+                print(f"  ⚠️  {label} error (attempt {attempt + 1}/{max_retries}): {err[:120]}")
+                print(f"  ⏳ Retrying in {wait:.1f}s{'  ← API-specified wait' if api_wait else ''}...")
                 time.sleep(wait)
             else:
                 raise
@@ -261,123 +266,106 @@ if kb_result.get("matched"):
         f"Proven fix: {kb_result['past_fix']}"
     )
 
-analysis_prompt = f"""You are a Senior DevOps Solutions Architect specializing in CI/CD reliability engineering.
+# ─── Steps 3 + 4 combined: ONE Gemini call ───────────────────────────────────
+# Day 02 principle: minimise API calls, not just tokens.
+# Two separate calls (analyze → draft) consumed 2 of 20 free-tier daily requests.
+# One combined call returns both the structured analysis AND the PR description.
+# The pr_description is a Markdown string embedded in the JSON response.
 
-Your role: diagnose CI failures and recommend long-term, maintainable fixes — not quick patches that mask the problem.
+header(3, "Root Cause Analysis + PR Description (combined)", "Day 02+03: 1 call, 2 outputs")
+
+low_confidence_note = (
+    "\n- If confidence must be low, add a `low_confidence_warning` field explaining why."
+)
+rag_note = (
+    f"\nKnowledge base match (similarity: {kb_result['similarity']}):\n"
+    f"Past failure: {kb_result['error']} [{kb_result['category']}]\n"
+    f"Proven fix: {kb_result['past_fix']}"
+    if kb_result.get("matched") else ""
+)
+
+combined_prompt = f"""You are a Senior DevOps Solutions Architect specializing in CI/CD reliability engineering.
+
+Your role: diagnose CI failures and recommend long-term, maintainable fixes — not quick patches.
 
 Rules:
 1. Identify the ROOT CAUSE (what actually broke, not just which step failed)
 2. Recommend the MINIMUM change that makes the system reliably correct going forward
 3. Prefer explicit version pinning over floating ranges to prevent future conflicts
-4. If the fix requires coordination with other teams or pipelines, include that in fix_command
-5. If you see a systemic pattern (not a one-off), note it in root_cause
+4. If the fix requires coordination with other teams, include that in fix_command
 
-Return ONLY valid JSON with exactly these keys:
+Return ONLY valid JSON with exactly these keys — no markdown fences, no text outside the JSON:
 {{
-  "error_type": "short label: npm-dependency | docker-build | test-failure | github-actions | database | other",
-  "root_cause": "one sentence — the actual cause, not just what failed",
+  "error_type": "npm-dependency | docker-build | test-failure | github-actions | database | other",
+  "root_cause": "one sentence — the actual cause, not just which step failed",
   "affected_file": "exact file or config to change e.g. package.json",
-  "fix_command": "exact command or code change — must be copy-paste ready",
+  "fix_command": "exact command — copy-paste ready e.g. npm install react@18.0.0 react-dom@18.0.0 --save-exact",
   "severity": "low | medium | high",
   "confidence": "high | medium | low",
-  "pr_title": "fix: short title under 72 chars"
+  "pr_title": "fix: short title under 72 chars",
+  "pr_description": "## Problem\\n...\\n\\n## Root Cause\\n...\\n\\n## Proposed Fix\\n```\\n<fix_command>\\n```\\n\\n## How to Verify\\n- bullet 1\\n- bullet 2\\n\\n⚠️ This fix was proposed by AI analysis. Review before merging."
 }}
+
+Rules for pr_description:
+- Use \\n for newlines inside the JSON string
+- Reference the knowledge base match if present (similarity score + proven fix)
+- Add a low confidence warning section if confidence is low
+- End with exactly: ⚠️ This fix was proposed by AI analysis. Review before merging.
+- Keep under 250 words{low_confidence_note}
 
 CI failure log (extracted error lines only — {extracted_tokens} tokens):
 {extracted}
-{past_context}"""
+{rag_note}"""
 
-prompt_tokens = len(analysis_prompt) // CHARS_PER_TOKEN
-kv("Sending to Gemini", f"~{prompt_tokens} tokens")
+prompt_tokens = len(combined_prompt) // CHARS_PER_TOKEN
+kv("Sending to Gemini", f"~{prompt_tokens} tokens  (analysis + PR body in one call)")
 kv("Includes RAG context", str(kb_result.get("matched", False)))
+kv("Gemini calls", "1  (was 2 — halves daily quota usage)")
 print(f"  Calling {MODEL}...")
 
-def call_analyze():
+def call_combined():
     return client.models.generate_content(
         model=MODEL,
         config=types.GenerateContentConfig(
             system_instruction=(
                 "You are a Senior DevOps Solutions Architect. "
-                "Return ONLY a valid JSON object. No markdown, no explanation outside the JSON."
+                "Return ONLY a valid JSON object. No markdown fences, no text outside the JSON."
             ),
             response_mime_type="application/json",
         ),
-        contents=analysis_prompt,
+        contents=combined_prompt,
     )
 
-response = with_retry(call_analyze, label="analyze_root_cause")
-raw_analysis = response.text.strip()
+response = with_retry(call_combined, label="analyze+draft")
+raw = response.text.strip()
 
 # Strip code fences defensively
-if raw_analysis.startswith("```"):
-    inner = raw_analysis.split("\n")[1:-1]
-    raw_analysis = "\n".join(inner).strip()
+if raw.startswith("```"):
+    inner = raw.split("\n")[1:-1]
+    raw = "\n".join(inner).strip()
 
 try:
-    analysis = json.loads(raw_analysis)
-    print()
-    kv("error_type", analysis.get("error_type", "—"))
-    kv("root_cause", (analysis.get("root_cause", "—"))[:80])
-    kv("affected_file", analysis.get("affected_file", "—"))
-    kv("fix_command", (analysis.get("fix_command", "—"))[:80])
-    kv("severity", analysis.get("severity", "—"))
-    kv("confidence", analysis.get("confidence", "—"))
-    kv("pr_title", analysis.get("pr_title", "—"))
+    analysis = json.loads(raw)
 except json.JSONDecodeError as exc:
     print(f"  ⚠️  Could not parse Gemini response as JSON: {exc}")
-    print(f"  Raw response:\n{raw_analysis[:300]}")
+    print(f"  Raw response:\n{raw[:300]}")
     sys.exit(1)
 
+pr_description = analysis.get("pr_description", "")
 
-# ─── Step 4: Draft PR description ────────────────────────────────────────────
-
-header(4, "Draft PR Description", "Day 03: Structured Output")
-
-pr_prompt = f"""Write a GitHub PR description in Markdown for this CI failure fix.
-
-Use exactly this structure:
-
-## Problem
-(what failed and where — one short paragraph)
-
-## Root Cause
-(one sentence — use the root_cause from the analysis)
-
-## Proposed Fix
-(the exact fix_command in a code block, which file to change)
-
-## How to Verify
-(2–3 bullet points to confirm the fix works after merging)
-
-{"## ⚠️ Low Confidence" + chr(10) + "(add a note that manual review is especially important for this fix)" + chr(10) if analysis.get("confidence") == "low" else ""}
-{"Reference this past similar failure from our knowledge base: " + kb_result["error"] + " — proven fix: " + kb_result["past_fix"] if kb_result.get("matched") else ""}
-
-Keep the entire description under 250 words.
-End with exactly this line:
-
-⚠️ This fix was proposed by AI analysis. Review before merging.
-
-Analysis:
-{json.dumps(analysis, indent=2)}"""
-
-prompt_tokens_pr = len(pr_prompt) // CHARS_PER_TOKEN
-kv("Sending to Gemini", f"~{prompt_tokens_pr} tokens")
-print(f"  Calling {MODEL}...")
-
-def call_draft():
-    return client.models.generate_content(
-        model=MODEL,
-        contents=pr_prompt,
-    )
-
-response_pr = with_retry(call_draft, label="draft_pr_description")
-pr_description = response_pr.text.strip()
-
+print()
+kv("error_type", analysis.get("error_type", "—"))
+kv("root_cause", str(analysis.get("root_cause", "—"))[:80])
+kv("affected_file", analysis.get("affected_file", "—"))
+kv("fix_command", str(analysis.get("fix_command", "—"))[:80])
+kv("severity", analysis.get("severity", "—"))
+kv("confidence", analysis.get("confidence", "—"))
+kv("pr_title", analysis.get("pr_title", "—"))
 kv("PR body length", f"{len(pr_description)} chars | ~{len(pr_description) // CHARS_PER_TOKEN} tokens")
 print()
 print("  PR body preview:")
 print(f"  {DIVIDER}")
-for line in pr_description.split("\n")[:8]:
+for line in pr_description.replace("\\n", "\n").split("\n")[:8]:
     print(f"  │ {line}")
 print(f"  │ ...")
 print(f"  {DIVIDER}")
@@ -400,13 +388,15 @@ output = {
     "severity": analysis.get("severity"),
     "confidence": analysis.get("confidence"),
     "pr_title": analysis.get("pr_title", "fix: CI failure detected by AI analysis"),
-    "pr_description": pr_description,
+    "pr_description": pr_description.replace("\\n", "\n"),
     "knowledge_base_match": kb_result,
     "token_economics": {
         "full_log_tokens": full_tokens,
         "extracted_tokens": extracted_tokens,
         "tokens_saved": saved_tokens,
         "reduction_pct": reduction_pct,
+        "gemini_calls": 1,
+        "gemini_tokens_sent": prompt_tokens,
     },
 }
 
@@ -414,7 +404,7 @@ with open(ANALYSIS_FILE, "w") as f:
     json.dump(output, f, indent=2)
 
 kv("Written to", ANALYSIS_FILE)
-kv("Total Gemini calls", "2  (analyze_root_cause + draft_pr_description)")
-kv("Total tokens sent", f"~{prompt_tokens + prompt_tokens_pr}")
+kv("Total Gemini calls", "1  (combined analyze + draft)")
+kv("Tokens sent", f"~{prompt_tokens}")
 print()
 print("  ✅ Analysis complete. Passing to Step 2 (create_pr.py).")
