@@ -70,6 +70,7 @@ jobs:
       - name: "Step 1 — AI Log Analysis (RAG + Gemini)"
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           RUN_ID: ${{ github.run_id }}
           PYTHONUNBUFFERED: "1"
         run: python3 .github/scripts/analyze_log.py

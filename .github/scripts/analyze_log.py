@@ -39,7 +39,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RUN_ID = os.environ.get("RUN_ID", "unknown")
 LOG_FILE = "ci_failure.log"
 ANALYSIS_FILE = "analysis.json"
-MODEL = "gemini-3.6-flash"
+# Model is set via GitHub Actions Variable GEMINI_MODEL (plain text, visible in UI).
+# To change: Repo → Settings → Secrets and variables → Actions → Variables → GEMINI_MODEL
+# Default: gemini-3.1-flash-lite (500 RPD free tier — 25× more than gemini-3.6-flash's 20 RPD)
+MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
 
 DIVIDER = "─" * 62
 
