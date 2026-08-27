@@ -154,6 +154,11 @@ def apply_file_patch(affected_file, patch_type, search_string, replacement_strin
             print(f"  ⚠️  search_string not found in {affected_file}:")
             print(f"       Expected: {search_string!r:.80}")
             return False
+        # Guard: if the replacement already exists verbatim, the patch was already
+        # applied on a previous run of this same fix branch — skip to avoid duplicates.
+        if replacement_string and replacement_string in content:
+            print(f"  ⚠️  replacement already present in {affected_file} — patch already applied, skipping")
+            return False
         new_content = content.replace(search_string, replacement_string, 1)
 
     elif patch_type == "prepend":

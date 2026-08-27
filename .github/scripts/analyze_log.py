@@ -354,16 +354,17 @@ except FileNotFoundError:
 full_chars = sum(len(l) for l in lines)
 full_tokens = full_chars // CHARS_PER_TOKEN
 
+CONTEXT_WINDOW = 3  # lines to capture before and after each error match
+
 kept_indices = set()
 for i, line in enumerate(lines):
     if ERROR_PATTERNS.search(line):
-        if i > 0:
-            kept_indices.add(i - 1)
-        kept_indices.add(i)
+        for j in range(max(0, i - CONTEXT_WINDOW), min(len(lines), i + CONTEXT_WINDOW + 1)):
+            kept_indices.add(j)
 
 extracted_lines = [lines[i] for i in sorted(kept_indices)]
-if len(extracted_lines) > 80:
-    extracted_lines = extracted_lines[-80:]  # keep the most recent errors
+if len(extracted_lines) > 120:
+    extracted_lines = extracted_lines[-120:]  # keep the most recent errors
 
 extracted = "".join(extracted_lines)
 extracted_chars = len(extracted)
@@ -394,6 +395,63 @@ header(2, "Knowledge Base Search")
 kb_result = search_similar_failures(extracted)
 
 
+# ─── Step 2b: Affected file detection + content injection ────────────────────
+# Detect which source file is likely affected from the error log BEFORE calling
+# Gemini, then read its current content and include it in the prompt.
+# This prevents hallucinated fixes (e.g. adding a package that already exists).
+#
+# Detection order:
+#  1. JS/Python stack trace:  "(src/index.js:5:18)" or "File "src/foo.py", line 5"
+#  2. npm error keywords      → package.json
+#  3. Dockerfile keywords     → Dockerfile
+#  4. workflow YAML keywords  → .github/workflows/ci.yml
+
+FILE_CONTENT_LIMIT = 150  # max lines of file content to include in prompt
+
+def detect_affected_file(error_text):
+    """Return the most likely affected file path from CI error output."""
+    # JS stack trace: (path/to/file.js:line:col)
+    m = re.search(r'\(((?:src|lib|app|dist|scripts)/[^\s:)]+\.[jt]sx?):(\d+)', error_text)
+    if m:
+        return m.group(1)
+    # Python traceback: File "path/to/file.py", line N
+    m = re.search(r'File "([^"]+\.py)", line', error_text)
+    if m:
+        return m.group(1)
+    # npm / node_modules errors
+    if any(k in error_text.lower() for k in ["eresolve", "npm error", "cannot find module", "missing script"]):
+        return "package.json"
+    # Dockerfile build errors
+    if any(k in error_text.lower() for k in ["dockerfile", "docker build"]):
+        return "Dockerfile"
+    # GitHub Actions YAML errors
+    if any(k in error_text.lower() for k in ["workflow", ".github/workflows"]):
+        return ".github/workflows/ci.yml"
+    return None
+
+detected_file = detect_affected_file(extracted)
+file_content_note = ""
+
+if detected_file:
+    kv("Detected file", detected_file)
+    if os.path.exists(detected_file):
+        with open(detected_file, "r", errors="replace") as f:
+            file_lines = f.readlines()
+        if len(file_lines) <= FILE_CONTENT_LIMIT:
+            file_content_note = (
+                f"\nCurrent contents of {detected_file} "
+                f"({len(file_lines)} lines — USE THIS to understand what already exists before proposing a patch):\n"
+                f"```\n{''.join(file_lines)}```"
+            )
+            kv("File content", f"included ({len(file_lines)} lines)")
+        else:
+            kv("File content", f"skipped — {len(file_lines)} lines exceeds {FILE_CONTENT_LIMIT} limit")
+    else:
+        kv("File content", f"file not found on runner: {detected_file}")
+else:
+    kv("Detected file", "none — no file path extracted from log")
+
+
 # ─── Step 3: Root cause analysis + PR description ────────────────────────────
 # One Gemini call returns both the structured analysis (JSON fields) and the
 # ready-to-use PR description (Markdown string embedded in the JSON).
@@ -414,9 +472,11 @@ Your role: diagnose CI failures AND provide an executable patch so the fix branc
 
 Rules:
 1. Identify the ROOT CAUSE (what actually broke, not just which step failed)
-2. Provide patch_type + search_string + replacement_string so the fix can be applied automatically
-3. Prefer explicit version pinning over floating ranges to prevent future conflicts
-4. patch_type must NEVER be 'none' for code, config, or package errors — only for infra-level actions
+2. Read the current file content carefully (provided below if available) BEFORE proposing any patch
+3. NEVER add something that already exists in the file — check the current content first
+4. Provide patch_type + search_string + replacement_string so the fix can be applied automatically
+5. Prefer explicit version pinning over floating ranges to prevent future conflicts
+6. patch_type must NEVER be 'none' for code, config, or package errors — only for infra-level actions
 
 Return ONLY valid JSON with exactly these keys — no markdown fences, no text outside the JSON:
 {{
@@ -471,9 +531,9 @@ Rules for pr_description:
 - End with exactly: ⚠️ This fix was proposed by AI analysis. Review before merging.
 - Keep under 250 words
 
-CI failure log (extracted error lines only — {extracted_tokens} tokens):
+CI failure log (extracted error lines with ±3 lines of context — {extracted_tokens} tokens):
 {extracted}
-{rag_note}"""
+{rag_note}{file_content_note}"""
 
 prompt_tokens = len(combined_prompt) // CHARS_PER_TOKEN
 kv("Sending to Gemini", f"~{prompt_tokens} tokens")
