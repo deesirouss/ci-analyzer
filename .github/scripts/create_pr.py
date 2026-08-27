@@ -150,11 +150,12 @@ kv("fix_command", str(fix_command)[:80])
 kv("RAG match", f"{kb.get('error', 'none')} (similarity: {kb.get('similarity', 0)})" if kb.get("matched") else "none")
 kv("PR title", pr_title)
 
-# error_type is always a meaningful kebab-case label (never "other") —
-# the model generates a descriptive category name for unknown errors.
-# temperature=0.0 in the Gemini call ensures the same error always produces
-# the same error_type, keeping the branch name stable across re-runs.
-branch = f"fix/{error_type}-{SAFE_TRIGGER}"
+# Branch format: fix/{trigger_branch}-{error_type}
+# e.g. fix/dev-js-runtime-error, fix/main-npm-dependency
+# The trigger branch comes first so you immediately know which branch the fix targets.
+# error_type is always a meaningful label (never "other") — model generates a
+# descriptive category for unknown errors. temperature=0.0 keeps it stable across re-runs.
+branch = f"fix/{SAFE_TRIGGER}-{error_type}"
 kv("branch", branch)
 
 
