@@ -150,13 +150,11 @@ kv("fix_command", str(fix_command)[:80])
 kv("RAG match", f"{kb.get('error', 'none')} (similarity: {kb.get('similarity', 0)})" if kb.get("matched") else "none")
 kv("PR title", pr_title)
 
-# Branch label selection:
-# - Known error types (npm-dependency, docker-build, etc.) → use error_type directly
-# - Unknown errors (type == "other") → use the AI-generated error_slug instead.
-#   error_slug is produced with temperature=0.0, so the same failure always
-#   produces the same slug, keeping the branch name stable across re-runs.
-branch_label = error_slug if error_type == "other" and error_slug else error_type
-branch = f"fix/{branch_label}-{SAFE_TRIGGER}"
+# error_type is always a meaningful kebab-case label (never "other") —
+# the model generates a descriptive category name for unknown errors.
+# temperature=0.0 in the Gemini call ensures the same error always produces
+# the same error_type, keeping the branch name stable across re-runs.
+branch = f"fix/{error_type}-{SAFE_TRIGGER}"
 kv("branch", branch)
 
 
