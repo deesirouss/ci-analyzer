@@ -459,8 +459,10 @@ for _model in MODEL_PRIORITY:
     except Exception as e:
         err = str(e)
         is_daily_quota = "PerDay" in err or "GenerateRequestsPerDay" in err
-        if is_daily_quota and _model != MODEL_PRIORITY[-1]:
-            print(f"  ⚠️  {_model}: daily RPD quota exhausted — switching to next model...")
+        is_invalid_model = "404" in err or "NOT_FOUND" in err or "is not found" in err
+        if (is_daily_quota or is_invalid_model) and _model != MODEL_PRIORITY[-1]:
+            reason = "daily RPD quota exhausted" if is_daily_quota else "model ID not found"
+            print(f"  ⚠️  {_model}: {reason} — switching to next model...")
             continue
         raise
 
