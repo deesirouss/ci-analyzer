@@ -410,26 +410,59 @@ rag_note = (
 
 combined_prompt = f"""You are a Senior DevOps Solutions Architect specializing in CI/CD reliability engineering.
 
-Your role: diagnose CI failures and recommend long-term, maintainable fixes — not quick patches.
+Your role: diagnose CI failures AND provide an executable patch so the fix branch contains real file changes.
 
 Rules:
 1. Identify the ROOT CAUSE (what actually broke, not just which step failed)
-2. Recommend the MINIMUM change that makes the system reliably correct going forward
+2. Provide patch_type + search_string + replacement_string so the fix can be applied automatically
 3. Prefer explicit version pinning over floating ranges to prevent future conflicts
-4. If the fix requires coordination with other teams, include that in fix_command
+4. patch_type must NEVER be 'none' for code, config, or package errors — only for infra-level actions
 
 Return ONLY valid JSON with exactly these keys — no markdown fences, no text outside the JSON:
 {{
   "error_type": "A kebab-case category label for this error. For known patterns use exactly one of: npm-dependency | docker-build | test-failure | github-actions | database. For anything else generate a precise 2-3 word kebab-case label that describes the error class — NEVER use 'other'. Examples: 'js-runtime-error', 'node-import-error', 'missing-env-var', 'config-syntax-error', 'shell-script-error'.",
   "error_slug": "A specific kebab-case detail within the error_type — the exact variable, file, or identifier involved. Examples: 'deploymentcount-undefined', 'react-version-conflict', 'postgres-port-5432'. Lowercase, hyphens only.",
   "root_cause": "one sentence — the actual cause, not just which step failed",
-  "affected_file": "exact file or config to change e.g. package.json",
-  "fix_command": "exact command — copy-paste ready e.g. npm install react@18.0.0 react-dom@18.0.0 --save-exact",
+  "affected_file": "relative path from repo root to the file that must change. e.g. src/index.js or package.json",
+  "patch_type": "How to apply the fix. MUST be one of: 'search_replace' (find exact text and replace it — use for any line-level code fix) | 'prepend' (insert at the top of the file — use for missing imports or top-of-file declarations) | 'append' (insert at the end of the file) | 'none' (only when the fix requires infra action that cannot be done by editing a file, e.g. adding a NAT gateway or rotating a secret). Default to 'search_replace'. NEVER 'none' for JS/Python/config/package errors.",
+  "search_string": "For search_replace ONLY: the EXACT string currently in affected_file that must be replaced. Copy it character-for-character — it is used in a direct string search. Must be unique enough to appear once. Empty string for prepend/append/none.",
+  "replacement_string": "The exact content to substitute. For search_replace: replaces search_string — include any surrounding lines from search_string that must be preserved. For prepend: inserted at the very top of the file. For append: appended at the end. Use \\n for newlines. Empty string for none.",
+  "fix_command": "human-readable fix description or CLI command — shown in the PR description",
   "severity": "low | medium | high",
   "confidence": "high | medium | low",
   "pr_title": "fix: short title under 72 chars",
   "pr_description": "## Problem\\n...\\n\\n## Root Cause\\n...\\n\\n## Proposed Fix\\n```\\n<fix_command>\\n```\\n\\n## How to Verify\\n- bullet 1\\n- bullet 2\\n\\n⚠️ This fix was proposed by AI analysis. Review before merging."
 }}
+
+Patch examples (FOLLOW THESE EXACTLY):
+
+  JS ReferenceError — variable used before declaration:
+    affected_file: "src/index.js"
+    patch_type: "search_replace"
+    search_string: "deployments: deploymentCount,"
+    replacement_string: "const deploymentCount = 0;\\n    deployments: deploymentCount,"
+
+  Missing require/import at top of file:
+    affected_file: "src/index.js"
+    patch_type: "prepend"
+    search_string: ""
+    replacement_string: "const missingModule = require('missing-module');"
+
+  npm peer dependency conflict in package.json:
+    affected_file: "package.json"
+    patch_type: "search_replace"
+    search_string: "\\"react\\": \\"17.0.2\\""
+    replacement_string: "\\"react\\": \\"18.0.0\\""
+
+  Python NameError — undefined variable:
+    patch_type: "search_replace"
+    search_string: "result = undefined_var + 1"
+    replacement_string: "undefined_var = 0\\nresult = undefined_var + 1"
+
+  Infrastructure error (new service needed, IAM role missing, NAT gateway):
+    patch_type: "none"
+    search_string: ""
+    replacement_string: ""
 
 Rules for pr_description:
 - Use \\n for newlines inside the JSON string
@@ -500,6 +533,8 @@ kv("error_type", analysis.get("error_type", "—"))
 kv("error_slug", analysis.get("error_slug", "—"))
 kv("root_cause", str(analysis.get("root_cause", "—"))[:80])
 kv("affected_file", analysis.get("affected_file", "—"))
+kv("patch_type", analysis.get("patch_type", "—"))
+kv("search_string", repr(str(analysis.get("search_string", ""))[:60]))
 kv("fix_command", str(analysis.get("fix_command", "—"))[:80])
 kv("severity", analysis.get("severity", "—"))
 kv("confidence", analysis.get("confidence", "—"))
@@ -530,6 +565,9 @@ output = {
     "error_slug": analysis.get("error_slug", ""),
     "root_cause": analysis.get("root_cause"),
     "affected_file": analysis.get("affected_file"),
+    "patch_type": analysis.get("patch_type", "none"),
+    "search_string": analysis.get("search_string", "").replace("\\n", "\n"),
+    "replacement_string": analysis.get("replacement_string", "").replace("\\n", "\n"),
     "fix_command": analysis.get("fix_command"),
     "severity": analysis.get("severity"),
     "confidence": analysis.get("confidence"),
