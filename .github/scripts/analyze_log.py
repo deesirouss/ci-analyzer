@@ -420,8 +420,8 @@ Rules:
 
 Return ONLY valid JSON with exactly these keys — no markdown fences, no text outside the JSON:
 {{
-  "error_type": "npm-dependency | docker-build | test-failure | github-actions | database | other",
-  "error_slug": "kebab-case 2-4 word slug describing the specific error — used for git branch naming. Must be lowercase, hyphens only, no special chars. Examples: 'referenceerror-deploymentcount', 'eslint-config-missing', 'docker-entrypoint-not-found'. For known error_types use the type itself e.g. 'npm-dependency'.",
+  "error_type": "A kebab-case category label for this error. For known patterns use exactly one of: npm-dependency | docker-build | test-failure | github-actions | database. For anything else generate a precise 2-3 word kebab-case label that describes the error class — NEVER use 'other'. Examples: 'js-runtime-error', 'node-import-error', 'missing-env-var', 'config-syntax-error', 'shell-script-error'.",
+  "error_slug": "A specific kebab-case detail within the error_type — the exact variable, file, or identifier involved. Examples: 'deploymentcount-undefined', 'react-version-conflict', 'postgres-port-5432'. Lowercase, hyphens only.",
   "root_cause": "one sentence — the actual cause, not just which step failed",
   "affected_file": "exact file or config to change e.g. package.json",
   "fix_command": "exact command — copy-paste ready e.g. npm install react@18.0.0 react-dom@18.0.0 --save-exact",

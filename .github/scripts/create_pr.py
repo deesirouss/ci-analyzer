@@ -150,13 +150,12 @@ kv("fix_command", str(fix_command)[:80])
 kv("RAG match", f"{kb.get('error', 'none')} (similarity: {kb.get('similarity', 0)})" if kb.get("matched") else "none")
 kv("PR title", pr_title)
 
-# Branch label selection:
-# - Known error types (npm-dependency, docker-build, etc.) → use error_type directly
-# - Unknown errors (type == "other") → use the AI-generated error_slug instead.
-#   error_slug is produced with temperature=0.0, so the same failure always
-#   produces the same slug, keeping the branch name stable across re-runs.
-branch_label = error_slug if error_type == "other" and error_slug else error_type
-branch = f"fix/{branch_label}-{SAFE_TRIGGER}"
+# Branch format: fix/{trigger_branch}-{error_type}
+# e.g. fix/dev-js-runtime-error, fix/main-npm-dependency
+# The trigger branch comes first so you immediately know which branch the fix targets.
+# error_type is always a meaningful label (never "other") — model generates a
+# descriptive category for unknown errors. temperature=0.0 keeps it stable across re-runs.
+branch = f"fix/{SAFE_TRIGGER}-{error_type}"
 kv("branch", branch)
 
 
