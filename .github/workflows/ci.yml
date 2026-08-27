@@ -15,14 +15,14 @@ jobs:
 
       - name: Setup Node.js 24 LTS
         uses: actions/setup-node@v7.0.0
+
+      - name: Build
+        run: npm run build
         with:
           node-version: "24"
 
       - name: Install dependencies
-        run: npm install --test1
-
-      - name: Build
-        run: npm run build
+        run: npm install
 
   # ─── Job 2: AI Failure Analyzer ──────────────────────────────────────────────
   # Triggered only when the build job fails (if: failure()).
