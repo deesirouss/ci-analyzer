@@ -2,7 +2,8 @@ const React = require('react');
 
 function getDeploymentMetrics() {
   return {
-    deployments: deploymentCount,   // ReferenceError: deploymentCount is not defined
+    const deploymentCount = 0;
+    deployments: deploymentCount,
     successRate: 0.94,
     avgBuildTime: '3m 21s',
   };
