@@ -4,7 +4,9 @@
   "description": "Demo app for CI failure analysis",
   "main": "src/index.js",
   "scripts": {
+    "prestart": "npm install",
     "start": "node src/index.js",
+    "prebuild": "npm install",
     "build": "node src/index.js"
   },
   "dependencies": {
