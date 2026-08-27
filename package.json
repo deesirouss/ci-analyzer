@@ -1,13 +1,14 @@
 {
   "name": "ci-analyzer-demo",
-  "version": "1.0.0",
-  "description": "Demo app — intentional peer dependency conflict for Day 06 CI failure lab",
+  "version": "1.1.0",
+  "description": "Demo app for CI failure analysis",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js"
   },
   "dependencies": {
-    "react": "17.0.2",
-    "react-dom": "18.0.0"
+    "react": "18.0.0",
+    "react-dom": "18.0.0",
+    "ci-analyzer-metrics": "2.4.1"
   }
 }

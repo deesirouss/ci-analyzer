@@ -2,7 +2,7 @@ name: CI + AI Failure Analyzer
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
 
 jobs:
   # ─── Job 1: Build ────────────────────────────────────────────────────────────
