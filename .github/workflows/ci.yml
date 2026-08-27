@@ -21,6 +21,9 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Build
+        run: npm run build
+
   # ─── Job 2: AI Failure Analyzer ──────────────────────────────────────────────
   # Triggered only when the build job fails (if: failure()).
   # Two steps in one job so the log file written in Step 1 is available to Step 2

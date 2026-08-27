@@ -4,11 +4,11 @@
   "description": "Demo app for CI failure analysis",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "build": "node src/index.js"
   },
   "dependencies": {
     "react": "18.0.0",
-    "react-dom": "18.0.0",
-    "ci-analyzer-metrics": "2.4.1"
+    "react-dom": "18.0.0"
   }
 }
