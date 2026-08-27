@@ -2,7 +2,7 @@ name: CI + AI Failure Analyzer
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, test1]
 
 jobs:
   # ─── Job 1: Build ────────────────────────────────────────────────────────────
@@ -19,7 +19,7 @@ jobs:
           node-version: "24"
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --test1
 
       - name: Build
         run: npm run build
