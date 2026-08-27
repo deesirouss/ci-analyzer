@@ -108,6 +108,74 @@ def _parse_npm_packages(fix_command):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MAIN — General file patcher
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def apply_file_patch(affected_file, patch_type, search_string, replacement_string):
+    """
+    Apply a structured patch to any file in the repository.
+
+    Supports three strategies driven by the patch_type field from analysis.json:
+      search_replace — find exact text in the file and replace it (one occurrence)
+      prepend        — insert content at the very top of the file (for missing imports)
+      append         — insert content at the bottom of the file
+
+    This is the primary patching mechanism for all error types. The npm-dependency
+    fallback below is only reached when patch_type is 'none' or fields are empty.
+
+    Args:
+        affected_file:      relative path to the file (e.g. "src/index.js")
+        patch_type:         "search_replace" | "prepend" | "append" | "none"
+        search_string:      for search_replace: exact text to locate (must exist in file)
+        replacement_string: content to substitute or insert
+
+    Returns:
+        True if the file was modified and written, False otherwise.
+    """
+    if not patch_type or patch_type == "none":
+        return False
+
+    if not affected_file or affected_file in ("—", ""):
+        print(f"  ⚠️  No affected_file specified for patch")
+        return False
+
+    if not os.path.exists(affected_file):
+        print(f"  ⚠️  File not found: {affected_file}")
+        return False
+
+    with open(affected_file, "r") as f:
+        content = f.read()
+
+    if patch_type == "search_replace":
+        if not search_string:
+            print(f"  ⚠️  patch_type=search_replace requires a non-empty search_string")
+            return False
+        if search_string not in content:
+            print(f"  ⚠️  search_string not found in {affected_file}:")
+            print(f"       Expected: {search_string!r:.80}")
+            return False
+        new_content = content.replace(search_string, replacement_string, 1)
+
+    elif patch_type == "prepend":
+        sep = "" if replacement_string.endswith("\n") else "\n"
+        new_content = replacement_string + sep + content
+
+    elif patch_type == "append":
+        sep = "" if content.endswith("\n") else "\n"
+        new_content = content + sep + replacement_string
+
+    else:
+        print(f"  ⚠️  Unknown patch_type: {patch_type!r}")
+        return False
+
+    with open(affected_file, "w") as f:
+        f.write(new_content)
+
+    print(f"  Patched {affected_file} (patch_type={patch_type}) ✅")
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -138,6 +206,9 @@ fix_command = data.get("fix_command", "—")
 severity = data.get("severity", "—")
 confidence = data.get("confidence", "—")
 affected_file = data.get("affected_file", "—")
+patch_type = data.get("patch_type", "none")
+search_string = data.get("search_string", "")
+replacement_string = data.get("replacement_string", "")
 kb = data.get("knowledge_base_match", {})
 
 print()
@@ -146,6 +217,8 @@ kv("error_type", error_type)
 kv("severity", severity)
 kv("confidence", confidence)
 kv("affected_file", affected_file)
+kv("patch_type", patch_type)
+kv("search_string", repr(search_string[:60]) if search_string else "(none)")
 kv("fix_command", str(fix_command)[:80])
 kv("RAG match", f"{kb.get('error', 'none')} (similarity: {kb.get('similarity', 0)})" if kb.get("matched") else "none")
 kv("PR title", pr_title)
@@ -197,10 +270,9 @@ else:
 
 
 # ─── Apply the file fix ───────────────────────────────────────────────────────
-# For known error types, patch the affected file directly from fix_command.
-# Only the patched file is committed — the PR description carries the full
-# analysis context. For error types without an automated patch, the PR
-# description guides the reviewer to apply the fix manually.
+# Try the structured patch from analysis.json first (works for any file/error type).
+# For npm-dependency, fall back to the JSON-aware package.json patcher if needed.
+# Only the patched file is committed — the PR description carries the full analysis.
 
 print()
 print(f"  {DIVIDER}")
@@ -208,14 +280,28 @@ print("  Applying fix")
 print(f"  {DIVIDER}")
 
 files_changed = []
+patched = False
 
-if error_type == "npm-dependency":
+# Primary path: structured patch (patch_type + search_string + replacement_string)
+# Applies to any file for any error type — JS, Python, config, package.json, Dockerfile.
+if patch_type and patch_type != "none":
+    print(f"  Attempting structured patch: {patch_type} on {affected_file}")
+    patched = apply_file_patch(affected_file, patch_type, search_string, replacement_string)
+    if patched:
+        run(["git", "add", affected_file])
+        files_changed.append(affected_file)
+    else:
+        print(f"  Structured patch did not apply — trying fallback if available")
+
+# Fallback: npm-dependency — JSON-aware package.json version patching.
+# Used when the model returns patch_type=none or an empty search_string for npm errors.
+if not patched and error_type == "npm-dependency":
     parsed = _parse_npm_packages(fix_command)
     if parsed and os.path.exists("package.json"):
         with open("package.json") as f:
             pkg = json.load(f)
 
-        print(f"  Patching package.json:")
+        print(f"  npm fallback: patching package.json from fix_command")
         changed = False
         for name, to_ver in parsed.items():
             for dep_key in ("dependencies", "devDependencies", "peerDependencies"):
@@ -231,15 +317,16 @@ if error_type == "npm-dependency":
                 f.write("\n")
             run(["git", "add", "package.json"])
             files_changed.append("package.json")
+            patched = True
             print(f"  package.json updated and staged ✅")
         else:
             print(f"  ⚠️  Packages from fix_command not found in package.json")
             print(f"       fix_command: {fix_command}")
     else:
         print(f"  ⚠️  Could not parse packages from fix_command or package.json missing")
-        print(f"       fix_command: {fix_command}")
-else:
-    print(f"  error_type '{error_type}' — no automated file patch for this type")
+
+if not patched:
+    print(f"  No automated patch applied (patch_type={patch_type!r})")
     print(f"  Manual fix: {fix_command}")
     print(f"  Affected file: {affected_file}")
 
