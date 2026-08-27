@@ -133,6 +133,7 @@ with open(ANALYSIS_FILE) as f:
 pr_title = data.get("pr_title", "fix: CI failure detected by AI analysis")
 pr_description = data.get("pr_description", "")
 error_type = data.get("error_type", "unknown")
+error_slug = data.get("error_slug", "")
 fix_command = data.get("fix_command", "—")
 severity = data.get("severity", "—")
 confidence = data.get("confidence", "—")
@@ -149,10 +150,13 @@ kv("fix_command", str(fix_command)[:80])
 kv("RAG match", f"{kb.get('error', 'none')} (similarity: {kb.get('similarity', 0)})" if kb.get("matched") else "none")
 kv("PR title", pr_title)
 
-# Branch name is stable per error+branch combination.
-# Re-runs of the same error on the same trigger branch always use the same
-# fix branch, so the existing PR is updated rather than a duplicate opened.
-branch = f"fix/{error_type}-{SAFE_TRIGGER}"
+# Branch label selection:
+# - Known error types (npm-dependency, docker-build, etc.) → use error_type directly
+# - Unknown errors (type == "other") → use the AI-generated error_slug instead.
+#   error_slug is produced with temperature=0.0, so the same failure always
+#   produces the same slug, keeping the branch name stable across re-runs.
+branch_label = error_slug if error_type == "other" and error_slug else error_type
+branch = f"fix/{branch_label}-{SAFE_TRIGGER}"
 kv("branch", branch)
 
 
@@ -250,11 +254,22 @@ print(f"  {DIVIDER}")
 
 diff = run(["git", "diff", "--cached", "--quiet"], check=False)
 if diff.returncode != 0:
+    # Staged file changes exist — commit them (e.g. patched package.json)
     commit_msg = f"fix(ci): {error_type} fix for commit {SHORT_SHA}\n\nAI-generated analysis — run {RUN_ID}"
     run(["git", "commit", "-m", commit_msg])
-    kv("Committed", ", ".join(files_changed) if files_changed else "(no files)")
+    kv("Committed", ", ".join(files_changed))
 else:
-    kv("Committed", "no staged changes — PR description describes the fix, human applies it")
+    # No file patch for this error type — create an empty commit so the fix
+    # branch diverges from the base and GitHub allows PR creation.
+    # The PR description carries the full analysis; the human applies the fix.
+    commit_msg = (
+        f"fix(ci): AI analysis for {error_type} error at commit {SHORT_SHA}\n\n"
+        f"No automated file patch available for this error type.\n"
+        f"See PR description for root cause and manual fix steps.\n"
+        f"Run: {RUN_ID}"
+    )
+    run(["git", "commit", "--allow-empty", "-m", commit_msg])
+    kv("Committed", "empty commit (no automated patch — fix described in PR body)")
 
 
 # ─── Push ─────────────────────────────────────────────────────────────────────

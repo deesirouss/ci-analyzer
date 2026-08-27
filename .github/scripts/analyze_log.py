@@ -306,6 +306,10 @@ def call_gemini(model, prompt):
     return client.models.generate_content(
         model=model,
         config=types.GenerateContentConfig(
+            # temperature=0.0: fully deterministic output.
+            # The same error always produces the same error_slug, which keeps
+            # the fix branch name stable across re-runs of the same failure.
+            temperature=0.0,
             system_instruction=(
                 "You are a Senior DevOps Solutions Architect. "
                 "Return ONLY a valid JSON object. No markdown fences, no text outside the JSON."
@@ -417,6 +421,7 @@ Rules:
 Return ONLY valid JSON with exactly these keys — no markdown fences, no text outside the JSON:
 {{
   "error_type": "npm-dependency | docker-build | test-failure | github-actions | database | other",
+  "error_slug": "kebab-case 2-4 word slug describing the specific error — used for git branch naming. Must be lowercase, hyphens only, no special chars. Examples: 'referenceerror-deploymentcount', 'eslint-config-missing', 'docker-entrypoint-not-found'. For known error_types use the type itself e.g. 'npm-dependency'.",
   "root_cause": "one sentence — the actual cause, not just which step failed",
   "affected_file": "exact file or config to change e.g. package.json",
   "fix_command": "exact command — copy-paste ready e.g. npm install react@18.0.0 react-dom@18.0.0 --save-exact",
@@ -492,6 +497,7 @@ pr_description = analysis.get("pr_description", "")
 
 print()
 kv("error_type", analysis.get("error_type", "—"))
+kv("error_slug", analysis.get("error_slug", "—"))
 kv("root_cause", str(analysis.get("root_cause", "—"))[:80])
 kv("affected_file", analysis.get("affected_file", "—"))
 kv("fix_command", str(analysis.get("fix_command", "—"))[:80])
@@ -521,6 +527,7 @@ output = {
     "run_id": RUN_ID,
     "model": used_model,
     "error_type": analysis.get("error_type"),
+    "error_slug": analysis.get("error_slug", ""),
     "root_cause": analysis.get("root_cause"),
     "affected_file": analysis.get("affected_file"),
     "fix_command": analysis.get("fix_command"),
@@ -545,5 +552,12 @@ with open(ANALYSIS_FILE, "w") as f:
 kv("Written to", ANALYSIS_FILE)
 kv("Gemini calls", "1")
 kv("Tokens sent", f"~{prompt_tokens}")
+
+print()
+print(f"  {DIVIDER}")
+print(f"  Full analysis.json:")
+print(f"  {DIVIDER}")
+print(json.dumps(output, indent=2))
+print(f"  {DIVIDER}")
 print()
 print("  ✅ Analysis complete. Passing to Step 2 (create_pr.py).")
